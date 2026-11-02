@@ -1,11 +1,11 @@
 import express from "express";
 import { connectDB } from "./utils/features.js";
-import dotenv from "dotenv";
 import { errorMiddleware } from "./middlewares/error.js";
 import cookieParser from "cookie-parser";
 import { Server } from "socket.io";
 import { createServer } from "http";
-import { v4 as uuid } from "uuid";
+import mongoose from "mongoose";
+import { randomUUID } from "node:crypto";
 import cors from "cors";
 import { v2 as cloudinary } from "cloudinary";
 import {
@@ -19,25 +19,24 @@ import {
 } from "./constants/events.js";
 import { getSockets } from "./lib/helper.js";
 import { Message } from "./models/message.js";
+import { Chat } from "./models/chat.js";
 import { corsOptions } from "./constants/config.js";
 import { socketAuthenticator } from "./middlewares/auth.js";
+import { isChatMember } from "./lib/socketAuthorization.js";
+import { createOrGetMessage } from "./lib/idempotentMessage.js";
+import { PresenceTracker } from "./lib/presence.js";
 
 import userRoute from "./routes/user.js";
 import chatRoute from "./routes/chat.js";
 import adminRoute from "./routes/admin.js";
 
-dotenv.config({
-  path: "./.env",
-});
-
 const mongoURI = process.env.MONGO_URI;
 const port = process.env.PORT || 3000;
-const envMode = process.env.NODE_ENV.trim() || "PRODUCTION";
+const envMode = (process.env.NODE_ENV || "PRODUCTION").trim();
 const adminSecretKey = process.env.ADMIN_SECRET_KEY || "adsasdsdfsdfsdfd";
-const userSocketIDs = new Map();
-const onlineUsers = new Set();
-
-connectDB(mongoURI);
+const presence = new PresenceTracker();
+const userSocketIDs = presence.socketsByUser;
+const onlineUsers = presence.onlineUsers;
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -71,82 +70,118 @@ app.get("/", (req, res) => {
 io.use((socket, next) => {
   cookieParser()(
     socket.request,
-    socket.request.res,
+    {},
     async (err) => await socketAuthenticator(err, socket, next)
   );
 });
 
 io.on("connection", (socket) => {
   const user = socket.user;
-  userSocketIDs.set(user._id.toString(), socket.id);
+  const userId = user._id.toString();
+  const becameOnline = presence.connect(userId, socket.id);
+  if (becameOnline) socket.broadcast.emit(ONLINE_USERS, Array.from(onlineUsers));
 
-  socket.on(NEW_MESSAGE, async ({ chatId, members, message }) => {
-    const messageForRealTime = {
-      content: message,
-      _id: uuid(),
-      sender: {
-        _id: user._id,
-        name: user.name,
-      },
-      chat: chatId,
-      createdAt: new Date().toISOString(),
-    };
-
-    const messageForDB = {
-      content: message,
-      sender: user._id,
-      chat: chatId,
-    };
-
-    const membersSocket = getSockets(members);
-    io.to(membersSocket).emit(NEW_MESSAGE, {
-      chatId,
-      message: messageForRealTime,
-    });
-    io.to(membersSocket).emit(NEW_MESSAGE_ALERT, { chatId });
+  socket.on(NEW_MESSAGE, async (payload = {}, acknowledge) => {
+    const ack = typeof acknowledge === "function" ? acknowledge : () => {};
+    if (!payload || typeof payload !== "object") {
+      return ack({ success: false, message: "Invalid message payload" });
+    }
+    const { chatId, message } = payload;
+    const clientMessageId = payload.clientMessageId || randomUUID();
+    if (!mongoose.isValidObjectId(chatId) || typeof message !== "string" || !message.trim() ||
+      typeof clientMessageId !== "string" || clientMessageId.length > 128) {
+      return ack({ success: false, message: "Invalid chat or message", retryable: false, clientMessageId });
+    }
 
     try {
-      await Message.create(messageForDB);
+      const chat = await Chat.findById(chatId);
+      if (!isChatMember(chat, user._id)) {
+        return ack({ success: false, message: "You are not allowed to send messages in this chat" });
+      }
+
+      const { message: savedMessage, created } = await createOrGetMessage({
+        Message,
+        content: message.trim(),
+        senderId: user._id,
+        chatId: chat._id,
+        clientMessageId,
+      });
+      const messageForRealTime = {
+        ...savedMessage.toObject(),
+        sender: { _id: user._id, name: user.name },
+      };
+      const membersSocket = getSockets(chat.members);
+      const eventData = {
+        chatId: chat._id.toString(),
+        message: messageForRealTime,
+        clientMessageId,
+      };
+
+      io.to(membersSocket).emit(NEW_MESSAGE, eventData);
+      if (created) io.to(membersSocket).emit(NEW_MESSAGE_ALERT, { chatId: chat._id.toString() });
+      ack({ success: true, message: messageForRealTime, clientMessageId });
     } catch (error) {
-      throw new Error(error);
+      console.error("Failed to persist realtime message:", error.message);
+      ack({ success: false, message: "Message could not be saved", retryable: true, clientMessageId });
     }
   });
 
-  socket.on(START_TYPING, ({ members, chatId }) => {
-    const membersSockets = getSockets(members);
-    socket.to(membersSockets).emit(START_TYPING, { chatId });
+  const emitChatPresenceEvent = async (event, payload = {}) => {
+    if (!payload || !mongoose.isValidObjectId(payload.chatId)) return;
+    const chat = await Chat.findById(payload.chatId).select("members");
+    if (!isChatMember(chat, user._id)) return;
+    const membersSocket = getSockets(chat.members);
+    socket.to(membersSocket).emit(event, { chatId: chat._id.toString() });
+  };
+
+  socket.on(START_TYPING, (payload) => {
+    emitChatPresenceEvent(START_TYPING, payload).catch((error) => console.error(error));
   });
 
-  socket.on(STOP_TYPING, ({ members, chatId }) => {
-    const membersSockets = getSockets(members);
-    socket.to(membersSockets).emit(STOP_TYPING, { chatId });
+  socket.on(STOP_TYPING, (payload) => {
+    emitChatPresenceEvent(STOP_TYPING, payload).catch((error) => console.error(error));
   });
 
-  socket.on(CHAT_JOINED, ({ userId, members }) => {
-    onlineUsers.add(userId.toString());
-
-    const membersSocket = getSockets(members);
-    io.to(membersSocket).emit(ONLINE_USERS, Array.from(onlineUsers));
+  socket.on(CHAT_JOINED, async (payload = {}) => {
+    const chatId = payload?.chatId;
+    if (!mongoose.isValidObjectId(chatId)) return;
+    const chat = await Chat.findById(chatId).select("members");
+    if (!isChatMember(chat, user._id)) return;
+    presence.joinChat(socket.id, chat._id.toString());
+    io.to(getSockets(chat.members)).emit(ONLINE_USERS, Array.from(onlineUsers));
   });
 
-  socket.on(CHAT_LEAVED, ({ userId, members }) => {
-    onlineUsers.delete(userId.toString());
-
-    const membersSocket = getSockets(members);
-    io.to(membersSocket).emit(ONLINE_USERS, Array.from(onlineUsers));
+  socket.on(CHAT_LEAVED, async (payload = {}) => {
+    const chatId = payload?.chatId;
+    if (!mongoose.isValidObjectId(chatId)) return;
+    const chat = await Chat.findById(chatId).select("members");
+    if (!isChatMember(chat, user._id)) return;
+    presence.leaveChat(socket.id, chat._id.toString());
+    io.to(getSockets(chat.members)).emit(ONLINE_USERS, Array.from(onlineUsers));
   });
 
   socket.on("disconnect", () => {
-    userSocketIDs.delete(user._id.toString());
-    onlineUsers.delete(user._id.toString());
-    socket.broadcast.emit(ONLINE_USERS, Array.from(onlineUsers));
+    const becameOffline = presence.disconnect(userId, socket.id);
+    if (becameOffline) {
+      socket.broadcast.emit(ONLINE_USERS, Array.from(onlineUsers));
+    }
   });
 });
 
 app.use(errorMiddleware);
 
-server.listen(port, () => {
-  console.log(`Server is running on port ${port} in ${envMode} Mode`);
+const startServer = async () => {
+  await connectDB(mongoURI);
+  // The unique idempotency index must exist before socket writes are accepted.
+  await Message.createIndexes();
+  server.listen(port, () => {
+    console.log(`Server is running on port ${port} in ${envMode} Mode`);
+  });
+};
+
+startServer().catch((error) => {
+  console.error("Server startup failed:", error.message);
+  process.exitCode = 1;
 });
 
 export { envMode, adminSecretKey, userSocketIDs };

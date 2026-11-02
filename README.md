@@ -58,7 +58,7 @@ npm install
 # Create a .env file with the following variables
 MONGO_URI=your_mongodb_uri
 JWT_SECRET=your_jwt_secret
-CLIENT_SERVER = your_frontend_url
+CLIENT_URL=your_frontend_url
 CLOUDINARY_CLOUD_NAME=your_cloudinary_name
 CLOUDINARY_API_KEY=your_cloudinary_api_key
 CLOUDINARY_API_SECRET=your_cloudinary_api_secret
@@ -72,8 +72,8 @@ npm start
 cd ../client
 npm install
 
-# Update the server URL in your environment config if needed
-VITE_SERVER_URL=http://localhost:5000
+# Set this in Client/.env for local development
+VITE_SERVER=http://localhost:3000
 
 # Run the client
 npm run dev
@@ -131,7 +131,7 @@ npm run dev
 
 1. Create another Web Service for the client.
 
-2. Add the environment variable `VITE_SERVER_URL` pointing to the backend URL.
+2. Set the build-time environment variable `VITE_SERVER` to the HTTPS backend URL (for example, `https://chatto-yvjj.onrender.com`).
 
 3. Set the build command to `npm install && npm run build` and start command to `npm run preview`.
 

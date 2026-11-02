@@ -1,4 +1,4 @@
-import { Box, Typography } from "@mui/material";
+import { Box, Button, Typography } from "@mui/material";
 import React, { memo } from "react";
 import { lightBlue } from "../../constants/color";
 import moment from "moment";
@@ -6,7 +6,7 @@ import { fileFormat } from "../../lib/features";
 import RenderAttachment from "./RenderAttachment";
 import { motion } from "framer-motion";
 
-const MessageComponent = ({ message, user }) => {
+const MessageComponent = ({ message, user, onRetry }) => {
   const { sender, content, attachments = [], createdAt } = message;
 
   const sameSender = sender?._id === user?._id;
@@ -54,6 +54,13 @@ const MessageComponent = ({ message, user }) => {
             </Box>
           );
         })}
+
+      {message.pending && <Typography variant="caption">Sending…</Typography>}
+      {message.deliveryUnknown && (
+        <Button size="small" onClick={() => onRetry(message)}>
+          Retry send
+        </Button>
+      )}
 
       <Typography  variant="caption">
         {timeAgo}
