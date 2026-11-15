@@ -3,6 +3,10 @@ import mongoose, { Schema, model, Types } from "mongoose";
 const schema = new Schema(
   {
     content: String,
+    clientMessageId: {
+      type: String,
+      required: false,
+    },
 
     attachments: [
       {
@@ -30,6 +34,14 @@ const schema = new Schema(
   },
   {
     timestamps: true,
+  }
+);
+
+schema.index(
+  { sender: 1, chat: 1, clientMessageId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { clientMessageId: { $type: "string" } },
   }
 );
 

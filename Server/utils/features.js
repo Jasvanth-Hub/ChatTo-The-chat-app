@@ -3,27 +3,26 @@ import jwt from "jsonwebtoken";
 import { v4 as uuid } from "uuid";
 import { v2 as cloudinary } from "cloudinary";
 import { getBase64, getSockets } from "../lib/helper.js";
-
-const cookieOptions = {
-  maxAge: 15 * 24 * 60 * 60 * 1000,
-  sameSite: "none",
-  httpOnly: true,
-  secure: true,
-};
+import { cookieOptions } from "../constants/cookie.js";
 
 const connectDB = (uri) => {
-  mongoose
+  return mongoose
     .connect(uri, { dbName: "ChatTo" })
-    .then((data) => console.log(`Successfully connected to Data..: ${data.connection.host}`))
-    .catch((err) => {
-      throw err;
+    .then((data) => {
+      console.log(`Successfully connected to Data..: ${data.connection.host}`);
+      return data;
     });
 };
 
 const sendToken = (res, user, code, message) => {
   const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET);
 
-  return res.status(code).cookie("chatto-token", token, cookieOptions).json({
+  return res
+    // Remove pre-CHIPS cookies so both versions cannot be submitted together.
+    .cookie("chatto-token", "", { ...cookieOptions, partitioned: false, maxAge: 0 })
+    .status(code)
+    .cookie("chatto-token", token, cookieOptions)
+    .json({
     success: true,
     user,
     message,
